@@ -16,8 +16,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
+#include <iomanip>
 #include <memory>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <sstream>
@@ -321,9 +324,31 @@ std::string SequentialWriter::format_storage_uri(
   // Right now `base_folder_` is always just the folder name for where to install the bagfile.
   // The name of the folder needs to be queried in case
   // SequentialWriter is opened with a relative path.
+
+  // Extract prefix from directory name by removing timestamp pattern if present
+  // This handles the case when --output is not specified and default timestamped directory is used
+  // Currently, the default timestamp format is `YYYY_MM_DD-HH_MM_SS`
+  std::string dir_name = fs::path(base_folder).filename().generic_string();
+  std::regex timestamp_pattern(R"(_\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}$)");
+  std::string prefix = std::regex_replace(dir_name, timestamp_pattern, "");
+
+  // Generate timestamp at file creation time
+  auto now = std::chrono::system_clock::now();
+  auto time_t = std::chrono::system_clock::to_time_t(now);
+  std::tm tm_buf;
+#ifdef _WIN32
+  localtime_s(&tm_buf, &time_t);
+#else
+  localtime_r(&time_t, &tm_buf);
+#endif
+
+  std::stringstream timestamp_stream;
+  timestamp_stream << std::put_time(&tm_buf, "%Y_%m_%d-%H_%M_%S");
+  std::string timestamp = timestamp_stream.str();
+
+  // Generate filename in format {storage_count}_{prefix}_{timestamp}
   std::stringstream storage_file_name;
-  storage_file_name << fs::path(base_folder).filename().generic_string() << "_" <<
-    storage_count;
+  storage_file_name << storage_count << "_" << prefix << "_" << timestamp;
 
   return (fs::path(base_folder) / storage_file_name.str()).generic_string();
 }
