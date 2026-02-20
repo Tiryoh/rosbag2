@@ -87,6 +87,8 @@ void SequentialWriter::init_metadata()
   file_info.message_count = 0;
   metadata_.custom_data = storage_options_.custom_data;
   metadata_.files = {file_info};
+  per_file_topic_message_counts_.clear();
+  per_file_topic_message_counts_.emplace_back();  // Initialize tracking for first file
   metadata_.ros_distro = rcpputils::get_env_var("ROS_DISTRO");
   if (metadata_.ros_distro.empty()) {
     ROSBAG2_CPP_LOG_WARN(
@@ -150,19 +152,22 @@ void SequentialWriter::open(
     throw std::runtime_error{error.str()};
   }
 
-  use_cache_ = storage_options.max_cache_size > 0u;
+  use_cache_ =
+    storage_options.max_cache_size > 0u || storage_options.max_cache_duration > 0u;
+
   if (storage_options.snapshot_mode && !use_cache_) {
     throw std::runtime_error(
-            "Max cache size must be greater than 0 when snapshot mode is enabled");
+            "Either the max cache size or the maximum cache duration must be greater than 0"
+            " when snapshot mode is enabled");
   }
 
   if (use_cache_) {
     if (storage_options.snapshot_mode) {
       message_cache_ = std::make_shared<rosbag2_cpp::cache::CircularMessageCache>(
-        storage_options.max_cache_size);
+        storage_options.max_cache_size, storage_options.max_cache_duration);
     } else {
       message_cache_ = std::make_shared<rosbag2_cpp::cache::MessageCache>(
-        storage_options.max_cache_size);
+        storage_options.max_cache_size, storage_options.max_cache_duration);
     }
     cache_consumer_ = std::make_unique<rosbag2_cpp::cache::CacheConsumer>(
       message_cache_,
@@ -183,6 +188,7 @@ void SequentialWriter::open(
     }
   }
   storage_->update_metadata(metadata_);
+  next_file_index_ = 1;  // First file is 0, next will be 1
   is_open_ = true;
 }
 
@@ -338,10 +344,19 @@ void SequentialWriter::switch_to_next_storage()
     message_cache_->log_dropped();
   }
 
+  finalize_metadata();
   storage_->update_metadata(metadata_);
-  storage_options_.uri = format_storage_uri(
-    base_folder_,
-    metadata_.relative_file_paths.size());
+
+  // Check for overflow: if next_file_index_ is 0, we've wrapped around (very unlikely but possible)
+  if (next_file_index_ == 0) {
+    ROSBAG2_CPP_LOG_WARN_STREAM(
+      "File index counter has overflowed (wrapped to 0). "
+      "This should not happen in practice, but continuing with index 0. "
+      "If circular logging is enabled, ensure old files are deleted to avoid conflicts.");
+  }
+
+  storage_options_.uri = format_storage_uri(base_folder_, next_file_index_);
+  next_file_index_++;
   // TODO(morlov): If we would ever remove the upper level writer mutex lock, consider protecting
   //  storage_ with mutex to avoid race conditions with write(msg) call when we are switching to
   //  next storage and not using cache.
@@ -359,7 +374,12 @@ void SequentialWriter::switch_to_next_storage()
   file_info.path = strip_parent_path(storage_->get_relative_file_path());
   metadata_.files.push_back(file_info);
   metadata_.relative_file_paths.push_back(file_info.path);
+  per_file_topic_message_counts_.emplace_back();  // Initialize tracking for new file
 
+  // Delete oldest files if circular buffer limit exceeded (after new file is added)
+  delete_oldest_files_if_needed();
+
+  finalize_metadata();
   storage_->update_metadata(metadata_);
   {
     // Re-register all topics since we rolled-over to a new bagfile.
@@ -457,6 +477,7 @@ void SequentialWriter::write(std::shared_ptr<const rosbag2_storage::SerializedBa
     if (storage_->write_message(converted_msg)) {
       metadata_.files.back().message_count++;
       topic_information_ptr->message_count++;
+      per_file_topic_message_counts_.back()[message->topic_name]++;
     } else {
       message_lost = true;
     }
@@ -503,6 +524,8 @@ bool SequentialWriter::should_split_bagfile(
   if (storage_options_.max_bagfile_size !=
     rosbag2_storage::storage_interfaces::MAX_BAGFILE_SIZE_NO_SPLIT)
   {
+    // TODO(morlov): consider cached messages size in splitting decision. Right now we only consider
+    //  the size of already written messages in storage. Add message_cache_->get_current_size() API.
     should_split = (storage_->get_bagfile_size() >= storage_options_.max_bagfile_size);
   }
 
@@ -517,6 +540,62 @@ bool SequentialWriter::should_split_bagfile(
   }
 
   return should_split;
+}
+
+void SequentialWriter::delete_oldest_files_if_needed()
+{
+  if (storage_options_.max_bag_files == 0) {
+    return;
+  }
+
+  // Remove oldest file from tracking: adjust per-topic message counts and metadata
+  auto remove_oldest_file_from_tracking = [&]()
+    {
+      {
+        std::lock_guard<std::mutex> lock(topics_info_mutex_);
+        const auto & oldest_topic_counts = per_file_topic_message_counts_.front();
+        for (const auto & [topic_name, count] : oldest_topic_counts) {
+          auto it = topics_names_to_info_.find(topic_name);
+          if (it != topics_names_to_info_.end()) {
+            it->second.message_count -= count;
+          }
+        }
+      }
+      per_file_topic_message_counts_.pop_front();
+      metadata_.relative_file_paths.erase(metadata_.relative_file_paths.begin());
+      metadata_.files.erase(metadata_.files.begin());
+      if (!metadata_.files.empty()) {
+        metadata_.starting_time = metadata_.files.front().starting_time;
+      }
+    };
+
+  // Delete the oldest files until we're under the bag file count limit
+  while (metadata_.files.size() > storage_options_.max_bag_files) {
+    const auto & oldest_file = metadata_.files.front();
+    const auto file_path = fs::path(base_folder_) / oldest_file.path;
+
+    // Delete file from filesystem
+    if (fs::exists(file_path)) {
+      const auto file_size = fs::file_size(file_path);
+      const auto file_duration_ns = oldest_file.duration.count();
+      std::error_code ec;
+      bool file_removed = fs::remove(file_path, ec);
+      if (!file_removed || ec) {
+        ROSBAG2_CPP_LOG_ERROR(
+          "Failed to delete oldest bagfile: %s. Error: %s",
+                              file_path.generic_string().c_str(), ec.message().c_str());
+        break;  // Keep file in tracking; retry on next split to avoid tight loop
+      }
+      ROSBAG2_CPP_LOG_INFO(
+        "Deleted oldest bagfile: %s (%lu bytes, %lu ns)",
+                           oldest_file.path.c_str(), file_size, file_duration_ns);
+      remove_oldest_file_from_tracking();
+    } else {
+      ROSBAG2_CPP_LOG_ERROR("Oldest bagfile to delete not found: %s",
+                            file_path.generic_string().c_str());
+      remove_oldest_file_from_tracking();
+    }
+  }
 }
 
 bool SequentialWriter::message_within_accepted_time_range(
@@ -615,6 +694,7 @@ void SequentialWriter::write_messages(
       auto topic_info_it = topics_names_to_info_.find(messages[i]->topic_name);
       if (topic_info_it != topics_names_to_info_.end()) {
         topic_info_it->second.message_count++;
+        per_file_topic_message_counts_.back()[messages[i]->topic_name]++;
       }
     }
   }

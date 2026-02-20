@@ -124,6 +124,7 @@ class RecordOptions:
     rmw_serialization_format: str
     services: List[str]
     start_paused: bool
+    static_topics_uri: str
     statistics_max_publishing_rate: float
     topic_polling_interval: datetime.timedelta
     topic_qos_profile_overrides: dict
@@ -172,4 +173,4 @@ class ServiceRequestsSource:
     @property
     def value(self) -> int: ...
 
-def bag_rewrite(arg0: List[rosbag2_py._storage.StorageOptions], arg1: str) -> None: ...
+def bag_rewrite(input_options: List[rosbag2_py._storage.StorageOptions], input_config_file: str, output_config_file: str) -> None: ...
